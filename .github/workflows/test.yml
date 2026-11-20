@@ -157,6 +157,96 @@ jobs:
         run: |
           test "$GREETING" = "hello_world" || { echo "FAIL: GREETING='$GREETING'"; exit 1; }
 
+  test-verify:
+    name: Verify mode, murk 0.15.2 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run murk-action with an unknown mode
+        id: unknown
+        uses: ./
+        with:
+          murk-key: 'AGE-SECRET-KEY-1DUMMY'
+          mode: 'decrypt'
+        continue-on-error: true
+
+      - name: Verify the action refused it before installing murk
+        run: |
+          test "${{ steps.unknown.outcome }}" = "failure" || { echo "FAIL: unknown mode was accepted"; exit 1; }
+          test -z "${{ steps.unknown.outputs.version }}" || { echo "FAIL: murk was installed"; exit 1; }
+
+      - name: Install murk 0.15.2 (vault will fail)
+        uses: ./
+        with:
+          murk-key: 'AGE-SECRET-KEY-1DUMMY'
+          version: '0.15.2'
+          vault: 'nonexistent.murk'
+        continue-on-error: true
+
+      - name: Verify step on pull request merges (branch-only and driverless merges)
+        run: test/verify-mode.sh
+
+      - name: Create test vault signed by another machine
+        run: |
+          AUTHOR_HOME="${RUNNER_TEMP}/author-home"
+          mkdir -p "$AUTHOR_HOME"
+          echo "ci-test" | HOME="$AUTHOR_HOME" murk init --vault test.murk
+          MURK_KEY=$(cat "$(sed -n "s/^export MURK_KEY_FILE='\\(.*\\)'/\\1/p" .env)")
+          echo "hello_world" | HOME="$AUTHOR_HOME" MURK_KEY="$MURK_KEY" murk add GREETING --vault test.murk
+          {
+            echo "TEST_MURK_KEY=$MURK_KEY"
+            echo "TEST_SIGNER=$(HOME="$AUTHOR_HOME" MURK_KEY="$MURK_KEY" murk trust --print-key)"
+          } >> "$GITHUB_ENV"
+
+      # No murk-key, as on a pull request from a fork.
+      - name: Run murk-action in verify mode
+        id: verify
+        uses: ./
+        with:
+          version: '0.15.2'
+          vault: 'test.murk'
+          trusted-signers: ${{ env.TEST_SIGNER }}
+          mode: 'verify'
+
+      - name: Verify nothing was exported
+        run: |
+          test -z "${GREETING:-}" || { echo "FAIL: GREETING was exported"; exit 1; }
+          test -z "${{ steps.verify.outputs.keys }}" || { echo "FAIL: keys output is set"; exit 1; }
+
+      - name: Run murk-action in export mode
+        id: export
+        uses: ./
+        with:
+          murk-key: ${{ env.TEST_MURK_KEY }}
+          version: '0.15.2'
+          vault: 'test.murk'
+          trusted-signers: ${{ env.TEST_SIGNER }}
+          mode: 'export'
+
+      - name: Verify secrets are in environment
+        run: |
+          test "$GREETING" = "hello_world" || { echo "FAIL: GREETING='$GREETING'"; exit 1; }
+          test "${{ steps.export.outputs.keys }}" = "GREETING" || { echo "FAIL: keys='${{ steps.export.outputs.keys }}'"; exit 1; }
+
+      - name: Run murk-action in verify mode with murk 0.15.1
+        id: old
+        uses: ./
+        with:
+          version: '0.15.1'
+          vault: 'test.murk'
+          trusted-signers: ${{ env.TEST_SIGNER }}
+          mode: 'verify'
+        continue-on-error: true
+
+      - name: Verify the action refused murk 0.15.1 in verify mode
+        run: |
+          test "${{ steps.old.outcome }}" = "failure" || { echo "FAIL: verify mode ran with murk 0.15.1"; exit 1; }
+          test "${{ steps.old.outputs.version }}" = "0.15.1" || { echo "FAIL: murk 0.15.1 was not installed, so the failure proves nothing"; exit 1; }
+
   test-version-pin:
     name: Version pin
     runs-on: ubuntu-latest

@@ -36,11 +36,12 @@ steps:
 
 | Input             | Required | Default  | Description                            |
 |-------------------|----------|----------|----------------------------------------|
-| `murk-key`        | yes      |          | Age secret key (`AGE-SECRET-KEY-1...`), or a whole grant key file; see [Agent grant keys](#agent-grant-keys) |
+| `murk-key`        | export   |          | Age secret key (`AGE-SECRET-KEY-1...`), or a whole grant key file; see [Agent grant keys](#agent-grant-keys). Not used in verify mode |
 | `version`         | no       | `latest` | murk version, 0.10.2 or newer (e.g. `0.14.0`). 0.14 and later need `trusted-signers` or a whole grant key file |
 | `vault`           | no       | `.murk`  | Path to vault file                     |
 | `tags`            | no       |          | Space-separated tags to filter secrets |
 | `trusted-signers` | no       |          | Signers trusted to sign the vault, one per line or comma-separated. Required by murk 0.14 and later; see below |
+| `mode`            | no       | `export` | `export` decrypts the vault and exports its secrets. `verify` checks the vault's signature without a key and exports nothing; see [Check pull requests](#check-pull-requests). `verify` needs murk 0.15.2 or later |
 
 ## murk 0.14 and later
 
@@ -125,6 +126,109 @@ replace the secret, and remove their entry from `trusted-signers`. Renew the
 grant the same way before it expires. To end CI's access, run
 `murk agent revoke ci`.
 
+## Check pull requests
+
+When two branches change the vault, the murk merge driver merges the two
+vaults into one valid vault. GitHub does not run custom merge drivers. Its
+merge button, merge queue and conflict editor merge the vault as text.
+
+Two independent changes to a vault always conflict as text, because each
+change rewrites the vault's MAC and signature lines. If someone resolves that
+conflict without the merge driver, for example in the GitHub conflict editor,
+the result is valid JSON but not a valid vault. murk refuses to load it, but
+you find out only after the merge, on the base branch.
+
+`mode: verify` finds that vault in the pull request. It needs no key, so it
+also runs on pull requests from forks. Run it on the pull request's merge:
+
+```yaml
+name: Vault
+
+on:
+  pull_request:
+  merge_group: # only if you use a merge queue
+
+jobs:
+  verify-vault:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: interrupted-sh/murk-action@v1
+        with:
+          mode: verify
+          trusted-signers: ${{ vars.MURK_TRUSTED_SIGNERS }}
+```
+
+Then make `verify-vault` a required status check in the branch protection
+rule or ruleset of the base branch.
+
+GitHub does not give repository variables to workflows for pull requests
+from forks. If you accept pull requests from forks, write the
+`trusted-signers` entries in the workflow file instead. They contain only
+public keys.
+
+On a `pull_request` event, `actions/checkout` checks out the merge that
+GitHub makes for the pull request (`refs/pull/N/merge`) by default. On a
+`merge_group` event, it checks out the merge queue's merge. Do not set `ref`,
+or the step checks the branch and not the merge.
+
+In verify mode, the action installs murk and runs
+`murk verify --signature-only` on the vault. murk reads no key and decrypts
+nothing. It checks that the vault is valid and that its signature verifies
+against an entry in `trusted-signers`. The action ignores `murk-key` in this
+mode and sets no `keys` output. Verify mode needs murk 0.15.2 or later and
+the `trusted-signers` input.
+
+The step fails in these cases:
+
+- The vault is not valid, or its signature does not verify. The error tells
+  you that both branches changed the vault and that a merge without the murk
+  merge driver cannot combine them.
+- No entry in `trusted-signers` signed the vault, or the vault is unsigned.
+  The error shows the reason from murk.
+
+The check does not decrypt the vault, so it does not check the MAC inside the
+encrypted metadata. murk checks the signature on the vault's fields after it
+parses the file. A change to a field fails the check. A change to formatting,
+or a field that murk does not know, can still pass. The check does not prove
+the exact bytes of the file.
+
+The check accepts a vault from any signer in `trusted-signers`. It does not
+apply the rules for removed keys or group membership that murk applies on a
+teammate's machine. When someone leaves the team, remove their entry from
+`trusted-signers`, in the repository variable or in the workflow file. Until
+you do, the check accepts vaults that they sign.
+
+A pull request where only the branch changed the vault passes, if a signer in
+`trusted-signers` wrote the change.
+
+### Fix a pull request that fails the check
+
+1. Run `murk setup-merge-driver` in your clone, if you have not done it yet.
+2. If the branch contains a merge commit that broke the vault, remove it.
+   For example, reset the branch to the commit before that merge.
+3. Run `git fetch origin && git merge origin/<base branch>`. The murk merge
+   driver merges the vault.
+4. Push the branch. If you removed a commit in step 2, use
+   `git push --force-with-lease`.
+5. When the check passes, merge the pull request.
+
+### What the check does not do
+
+- It does not run while the pull request has a merge conflict. GitHub runs
+  no `pull_request` workflows then, and it does not let you merge. Resolve the
+  conflict locally with the steps above.
+- It cannot check an unsigned vault. Vaults written before murk 0.14, or by
+  ssh-rsa or plugin keys, have no signature.
+- It checks the merge with the base branch at the time of the check. If the
+  base branch changes the vault later, the result is out of date. To prevent
+  this, require branches to be up to date before merging, or use a merge queue
+  with the `merge_group` trigger.
+- It does not merge vaults. A merged vault must be signed, and a grant key
+  cannot sign. A merge in CI would need a teammate's full key, so the action
+  does not do it.
+
 ## Examples
 
 ### Pin a version
@@ -176,7 +280,7 @@ If you prefer subprocess injection over `$GITHUB_ENV`:
 ## How it works
 
 1. Downloads the murk binary from GitHub Releases for the runner platform and verifies its checksum and build-provenance signature
-2. Runs `murk export` to decrypt the vault, with `MURK_TRUSTED_SIGNERS` set from `trusted-signers` when given
+2. In export mode, runs `murk export` to decrypt the vault, with `MURK_TRUSTED_SIGNERS` set from `trusted-signers` when given. In verify mode, runs `murk verify --signature-only` without a key and stops there
 3. Masks each secret value with `::add-mask::`
 4. Writes each key-value pair to `$GITHUB_ENV`
 
