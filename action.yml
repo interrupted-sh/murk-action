@@ -1,13 +1,14 @@
 name: 'murk-action'
-description: 'Decrypt murk secrets and inject into CI environment'
+description: 'Decrypt murk secrets and inject them into the CI environment, or check that a vault verifies'
 branding:
   icon: 'lock'
   color: 'gray-dark'
 
 inputs:
   murk-key:
-    description: 'Age secret key (AGE-SECRET-KEY-1...), or a whole murk agent grant key file (its "# murk-..." comment lines and its AGE-SECRET-KEY-1... line), passed to murk unchanged'
-    required: true
+    description: 'Age secret key (AGE-SECRET-KEY-1...), or a whole murk agent grant key file (its "# murk-..." comment lines and its AGE-SECRET-KEY-1... line), passed to murk unchanged. Required in export mode; not used in verify mode'
+    required: false
+    default: ''
   version:
     description: 'murk version to install, 0.10.2 or newer (e.g. "0.14.0" or "latest"); murk 0.14 and later need trusted-signers or a whole grant key file as murk-key'
     required: false
@@ -24,18 +25,35 @@ inputs:
     description: 'Signers trusted to sign the vault, one per line or comma-separated: each signer''s `murk trust --print-key` output. Required by murk 0.14 and later; ignored by older murk'
     required: false
     default: ''
+  mode:
+    description: '"export" (default) decrypts the vault and exports its secrets. "verify" only checks, without a key, that the vault''s signature verifies against trusted-signers, for example on a pull request''s merge, and exports nothing. verify needs murk 0.15.2 or later and trusted-signers'
+    required: false
+    default: 'export'
 
 outputs:
   version:
     description: 'Installed murk version'
     value: ${{ steps.install.outputs.version }}
   keys:
-    description: 'Space-separated list of exported key names'
+    description: 'Space-separated list of exported key names (empty in verify mode)'
     value: ${{ steps.export.outputs.keys }}
 
 runs:
   using: 'composite'
   steps:
+    - name: Check mode
+      shell: bash
+      run: |
+        case "$INPUT_MODE" in
+          export | verify) ;;
+          *)
+            echo "::error::Unknown mode '${INPUT_MODE}'. Use export or verify."
+            exit 1
+            ;;
+        esac
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+
     - name: Install murk
       id: install
       shell: bash
@@ -135,6 +153,7 @@ runs:
         GH_TOKEN: ${{ github.token }}
 
     - name: Export secrets
+      if: inputs.mode == 'export'
       id: export
       shell: bash
       run: |
@@ -146,6 +165,10 @@ runs:
         # murk unchanged. Never echo a line of it: only the secret line is
         # masked, and a multi-line ::add-mask:: would print the lines after the
         # first.
+        if [ -z "$MURK_KEY" ]; then
+          echo "::error::murk-key is required in export mode"
+          exit 1
+        fi
         KEY_LINE=""
         while IFS= read -r line || [ -n "$line" ]; do
           line="${line%$'\r'}"
@@ -255,3 +278,67 @@ runs:
         INPUT_VAULT: ${{ inputs.vault }}
         INPUT_TAGS: ${{ inputs.tags }}
         INPUT_TRUSTED_SIGNERS: ${{ inputs.trusted-signers }}
+
+    - name: Verify vault
+      id: verify
+      if: inputs.mode == 'verify'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Keyless: murk checks the vault's signature against trusted-signers
+        # and never reads a key or decrypts. murk-key is not used here.
+        if ! [[ "$MURK_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+          echo "::error::mode: verify cannot read the murk version (v${MURK_VERSION})"
+          exit 1
+        fi
+        MAJOR=$((10#${BASH_REMATCH[1]})) MINOR=$((10#${BASH_REMATCH[2]})) PATCH=$((10#${BASH_REMATCH[3]}))
+        if (( MAJOR == 0 && (MINOR < 15 || (MINOR == 15 && PATCH < 2)) )); then
+          echo "::error::mode: verify needs murk 0.15.2 or later, which can check a vault signature without a key (installed v${MURK_VERSION})"
+          exit 1
+        fi
+
+        if [ -n "$INPUT_TRUSTED_SIGNERS" ]; then
+          export MURK_TRUSTED_SIGNERS="$INPUT_TRUSTED_SIGNERS"
+        fi
+        # The backticks below are literal text, not command substitution.
+        # shellcheck disable=SC2016
+        if [ -z "${MURK_TRUSTED_SIGNERS:-}" ]; then
+          echo '::error::mode: verify needs the trusted-signers input: the `murk trust --print-key` output of each teammate who signs the vault.'
+          exit 1
+        fi
+
+        set +e
+        REASON=$(env -u MURK_KEY -u MURK_KEY_FILE -u MURK_AGENT -u CLICOLOR_FORCE NO_COLOR=1 \
+          murk verify --signature-only --vault "$INPUT_VAULT" 2>&1)
+        RC=$?
+        set -e
+        # murk can quote text from the vault, which the pull request controls.
+        # Stop GitHub from reading workflow commands in that text.
+        TOKEN=$(openssl rand -hex 16 2>/dev/null || date +%s%N)
+        echo "::stop-commands::${TOKEN}"
+        printf '%s\n' "$REASON"
+        echo "::${TOKEN}::"
+
+        if [ "$RC" -eq 0 ]; then
+          echo "::notice::The signature of ${INPUT_VAULT} verifies against trusted-signers"
+          exit 0
+        fi
+
+        BASE="${BASE_REF#refs/heads/}"
+        # shellcheck disable=SC2016
+        if grep -qE "$MERGE_FAILURE" <<<"$REASON"; then
+          printf '::error::%s did not pass the murk signature check. Both this branch and %s changed the vault. A merge without the murk merge driver, such as the GitHub merge or its conflict editor, cannot combine two vaults. Run `git fetch origin && git merge origin/%s` locally so that the murk merge driver merges the vault. Then push and merge the pull request.\n' \
+            "$INPUT_VAULT" "${BASE:-the base branch}" "${BASE:-<base branch>}"
+        else
+          printf '::error::%s did not pass the murk signature check. See the murk error above.\n' "$INPUT_VAULT"
+        fi
+        exit 1
+      env:
+        # murk reasons that a merge without the merge driver produces: a
+        # signature that does not verify, or a file that is not a valid vault.
+        MERGE_FAILURE: 'signature does not verify|vault parse error'
+        MURK_VERSION: ${{ steps.install.outputs.version }}
+        INPUT_VAULT: ${{ inputs.vault }}
+        INPUT_TRUSTED_SIGNERS: ${{ inputs.trusted-signers }}
+        BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
